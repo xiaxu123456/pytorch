@@ -3358,7 +3358,7 @@ class TestTorchDeviceType(TestCase):
             self.assertEqual(out.cpu(), view.cpu().t().contiguous(), atol=0, rtol=0)
 
     @onlyCUDA
-    @dtypes(torch.bool, torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+    @dtypes(torch.uint8, torch.float16, torch.bfloat16, torch.float32)
     @parametrize("layout", ("aligned", "word_aligned", "src_offset", "dst_offset", "src_pitch", "dst_pitch", "grid_stride"))
     def test_copy_transpose_tiled_vectorized(self, device, dtype, layout):
         h, w = (2052, 2060) if layout == "word_aligned" else (2064, 2096)
@@ -3378,7 +3378,7 @@ class TestTorchDeviceType(TestCase):
 
     @onlyCUDA
     @unittest.skipIf(not kineto_available(), "Kineto is required")
-    @dtypes(torch.bool, torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+    @dtypes(torch.uint8, torch.float16, torch.bfloat16, torch.float32)
     @parametrize("case", ("below", "at", "offset", "pitch"))
     def test_copy_transpose_tiled_small(self, device, dtype, case):
         es = torch.empty((), dtype=dtype).element_size()
@@ -3394,6 +3394,96 @@ class TestTorchDeviceType(TestCase):
         tiled = any("transpose_copy_tiled_kernel" in event.name for event in prof.events())
         self.assertEqual(tiled, case == "at" and es < 4)
         self.assertEqual(dst.cpu().view(torch.uint8), src.cpu().t().contiguous().view(torch.uint8))
+
+    # Batched 2D transposes ([B, C, L] <- [B, L, C], the conv1d/layer_norm
+    # permute pattern) must take the tiled path and match the generic copy
+    # bit-for-bit. Layouts cover: batch leading or in the middle of the source,
+    # the batch landing between the two transposed dims in the iterator
+    # (permute(2, 0, 1)), odd extents, a src or dst batch stride that breaks
+    # 16-byte alignment (vectorized tile rejected, scalar tile still used; dst
+    # padding untouched), a pitched dst inside each slice, a broadcast source
+    # (zero batch stride), more (batch x tile-row) pairs than gridDim.y, and
+    # slices individually below the size gate whose aggregate is above it.
+    @onlyCUDA
+    @dtypes(torch.uint8, torch.bfloat16, torch.float32, torch.float64)
+    @parametrize("layout", ("batch_first", "batch_middle", "batch_between", "odd", "padded_src_batch",
+                            "padded_dst_batch", "padded_dst_rows", "broadcast_batch", "big_batch", "small_slices"))
+    def test_copy_transpose_tiled_batched(self, device, dtype, layout):
+        es = torch.empty((), dtype=dtype).element_size()
+        if layout == "big_batch":
+            b, c, l = 66000, 32, 34
+        elif layout == "small_slices":
+            # each [c, l] slice is 1 KB; 8192 of them clear the 4 MB gate
+            b, c, l = 8192, 16, 256 // es
+        elif layout == "odd":
+            b, c, l = 9, 1001, 1027
+        else:
+            b, c, l = 24, 736, 1536 // es
+
+        def padded_batch(shape, fill=None):
+            n = shape[1] * shape[2]
+            base = make_tensor((shape[0], n + 1), dtype=dtype, device=device) if fill is None \
+                else torch.full((shape[0], n + 1), fill, dtype=dtype, device=device)
+            return base, base[:, :n].view(shape)
+
+        dst_shape = (b, c, l)
+        if layout == "batch_middle":
+            # src [L, B, C] contiguous -> dst [B, C, L]
+            src = make_tensor((l, b, c), dtype=dtype, device=device).permute(1, 2, 0)
+        elif layout == "batch_between":
+            # src [B, L, C] contiguous -> dst [C, B, L]: the iterator sees the
+            # src-contiguous dim after the batch dim
+            src = make_tensor((b, l, c), dtype=dtype, device=device).permute(2, 0, 1)
+            dst_shape = (c, b, l)
+        elif layout == "padded_src_batch":
+            _, src = padded_batch((b, l, c))
+            src = src.permute(0, 2, 1)
+        elif layout == "broadcast_batch":
+            src = make_tensor((1, l, c), dtype=dtype, device=device).expand(b, l, c).permute(0, 2, 1)
+        else:
+            src = make_tensor((b, l, c), dtype=dtype, device=device).permute(0, 2, 1)
+        if layout == "padded_dst_batch":
+            dst_base, dst = padded_batch(dst_shape, fill=0)
+        elif layout == "padded_dst_rows":
+            dst = torch.empty((b, c, l + 3), dtype=dtype, device=device)[:, :, :l]
+        else:
+            dst = torch.empty(dst_shape, dtype=dtype, device=device)
+
+        if torch.profiler.ProfilerActivity.CUDA in torch.profiler.supported_activities():
+            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+                dst.copy_(src)
+                torch.cuda.synchronize()
+            self.assertTrue(any("transpose_copy_tiled_kernel" in e.name for e in prof.events()), layout)
+        else:
+            dst.copy_(src)
+        self.assertEqual(dst.cpu().contiguous().view(torch.uint8), src.cpu().contiguous().view(torch.uint8))
+        if layout == "padded_dst_batch":
+            self.assertEqual(dst_base[:, -1].count_nonzero().item(), 0)
+
+    # Slices much smaller than a tile must stay on the generic path (the tiled
+    # kernel is slower there); the same guard applies to narrow 2D transposes.
+    @onlyCUDA
+    @unittest.skipIf(not kineto_available(), "Kineto is required")
+    @dtypes(torch.bfloat16, torch.float32)
+    def test_copy_transpose_tiled_small_slices_rejected(self, device, dtype):
+        def tiled(src):
+            dst = torch.empty(src.shape, dtype=dtype, device=device)
+            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+                dst.copy_(src)
+                torch.cuda.synchronize()
+            self.assertEqual(dst.cpu().view(torch.uint8), src.cpu().contiguous().view(torch.uint8))
+            return any("transpose_copy_tiled_kernel" in e.name for e in prof.events())
+
+        total = 64 << 20  # bytes, well above the size gate
+        es = torch.empty((), dtype=dtype).element_size()
+        for (c, l), expect in (((16, 16), False), ((512, 4), False), ((3, 512), False),
+                               ((16, 64), True), ((768, 1024), True)):
+            b = total // (c * l * es)
+            src = make_tensor((b, l, c), dtype=dtype, device=device).permute(0, 2, 1)
+            self.assertEqual(tiled(src), expect, (c, l))
+        # narrow 2D: [N, 3] -> [3, N]
+        src = make_tensor((total // (3 * es), 3), dtype=dtype, device=device).t()
+        self.assertFalse(tiled(src))
 
     # Shapes that must NOT take the tiled path, to guard the dispatch check.
     @onlyCUDA
@@ -3423,10 +3513,11 @@ class TestTorchDeviceType(TestCase):
         src = make_tensor((1024, 1024), dtype=torch.complex128, device=device)
         self.assertEqual(src.t().contiguous().cpu(),
                          src.cpu().t().contiguous(), atol=0, rtol=0)
-        # bool is 1 byte and rides the uint8 instantiation.
-        src = torch.randint(0, 2, (2048, 4099), dtype=torch.bool, device=device)
-        self.assertEqual(src.t().contiguous().cpu(),
-                         src.cpu().t().contiguous(), atol=0, rtol=0)
+        # bool stays on the generic path, which normalizes any nonzero byte to
+        # True (see NOTE [Loading boolean values]); a raw byte copy would not.
+        src = torch.full((2048, 4099), 7, dtype=torch.uint8, device=device).view(torch.bool)
+        out = src.t().contiguous()
+        self.assertEqual(out.view(torch.uint8).unique().tolist(), [1])
 
     def test_clone_all_dtypes_and_devices(self, device):
         for dt in all_types_and_complex_and(torch.half, torch.bool, torch.bfloat16):
